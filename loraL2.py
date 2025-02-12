@@ -2,132 +2,136 @@ import struct
 import random
 
 import time
-from machine import Pin, SPI
+from machine import unique_id, Pin, SPI
+
+import crc16
+
+from collections import OrderedDict
 
 class LoRaLevel2Protocol:
-    """
-    Level 2 Protocol for LoRa Physical Layer
-    Implements frame structure, addressing, error detection, and basic 
-    transmission control
-    """
     
     # Protocol Constants
-    FRAME_HEADER = b'\xAA'  # Start of frame delimiter
-    FRAME_FOOTER = b'\x55'  # End of frame delimiter
-    MAX_PAYLOAD_SIZE = 255  # Maximum payload size
+    FRAME_HEADER = b'\xAA'  	# Start of frame delimiter
+    FRAME_HEADER_ACK = b'\xBB'	# Start of ack frame delimiter
+    FRAME_FOOTER = b'\xFF'  	# End of frame delimiter
+    MAX_PAYLOAD_SIZE = 255  	# Maximum payload size
     
-    def __init__(self, device_id=None):
-        """
-        Initialize the LoRa Level 2 Protocol
-        
-        :param device_id: Unique identifier for this device (16-bit)
-        """
-        self.device_id = device_id or random.randint(0, 0xFFFF)
+    def __init__(self):
+        self.device_id = unique_id()
         self.sequence_number = 0
-    
-    def create_frame(self, destination_id, payload):
-        """
-        Create a complete frame with header, addressing, payload, and error detection
         
-        :param destination_id: Destination device ID (16-bit)
-        :param payload: Data to be transmitted
-        :return: Complete frame ready for transmission
-        """
-        # Validate payload size
+    def get_sequence_number(self):
+        return self.sequence_number
+    
+    def set_sequence_number(self, sequence_number):
+        self.sequence_number = sequence_number
+    
+    def create_frame(self, payload):
         if len(payload) > self.MAX_PAYLOAD_SIZE:
             raise ValueError("Payload exceeds maximum size")
-        
-        # Increment sequence number
         self.sequence_number = (self.sequence_number + 1) % 256
         
         # Frame Structure:
-        # [Header][Source ID][Dest ID][Seq Num][Payload Length][Payload][CRC16][Footer]
+        # [Header][Source ID][Seq Num][Payload Length][Payload][CRC16][Footer]
+        # Total Overhead size is 1+6+1+1+2+1=12
+        
         frame = bytearray()
         frame.extend(self.FRAME_HEADER)
-        
-        # Add source and destination IDs (16-bit each)
-        frame.extend(struct.pack('>H', self.device_id))
-        frame.extend(struct.pack('>H', destination_id))
-        
-        # Add sequence number
+        frame.extend(self.device_id)
         frame.append(self.sequence_number)
-        
-        # Add payload length and payload
         frame.append(len(payload))
-        frame.extend(payload)
-        
-        # Calculate CRC16 for error detection
-        crc = 1
+        frame.extend(payload)    
+        crc = crc16.crc16xmodem(frame[1:])
         frame.extend(struct.pack('>H', crc))
-        
-        # Add frame footer
         frame.extend(self.FRAME_FOOTER)
         
         return bytes(frame)
     
     def parse_frame(self, received_frame):
-        """
-        Parse an incoming frame and validate its integrity
-        
-        :param received_frame: Raw received frame bytes
-        :return: Parsed frame details or None if invalid
-        """
-        # Minimum frame size check
-        if len(received_frame) < 10:  # Minimum frame size
+        if len(received_frame) < 12: 
             return None
         
-        # Check header and footer
-        if (received_frame[0:1] != self.FRAME_HEADER or 
+        if (received_frame[0:1] != self.FRAME_HEADER and
+            received_frame[0:1] != self.FRAME_HEADER_ACK or
             received_frame[-1:] != self.FRAME_FOOTER):
             return None
         
-        try:
-            # Extract source and destination IDs
-            source_id = struct.unpack('>H', received_frame[1:3])[0]
-            dest_id = struct.unpack('>H', received_frame[3:5])[0]
+        if (received_frame[0:1] == self.FRAME_HEADER):
+            try:
+                source_id = ':'.join(f'{byte:02X}' for byte in received_frame[1:7])
+                seq_num = received_frame[7]
+                payload_len = received_frame[8]
+                payload = received_frame[9:9+payload_len].decode()
+                received_crc = received_frame[-3:-1]
+                frame_for_crc = received_frame[1:-3]
+                calculated_crc = struct.pack('>H', crc16.crc16xmodem(frame_for_crc))
+                if received_crc != calculated_crc:
+                    return None
+                
+                return OrderedDict({
+                    'Type: ': "DATA",
+                    'Source ID: ': source_id,
+                    'Sequence Number: ': seq_num,
+                    'Payload Lenght: ': payload_len,
+                    'Payload: ': payload
+                })
             
-            # Extract sequence number
-            seq_num = received_frame[5]
-            
-            # Extract payload length
-            payload_len = received_frame[6]
-            
-            # Extract payload
-            payload = received_frame[7:7+payload_len]
-            
-            # Verify CRC
-            received_crc = struct.unpack('>H', received_frame[-3:-1])[0]
-            frame_for_crc = received_frame[1:-3]
-            calculated_crc = 1
-            
-            if received_crc != calculated_crc:
+            except (struct.error, IndexError):
                 return None
-            
-            return {
-                'source_id': source_id,
-                'destination_id': dest_id,
-                'sequence_number': seq_num,
-                'payload': payload
-            }
-        
-        except (struct.error, IndexError):
-            return None
+        else:
+            source_id = ':'.join(f'{byte:02X}' for byte in received_frame[1:7])
+            dest_id = ':'.join(f'{byte:02X}' for byte in received_frame[7:13])
+            sequence_number = received_frame[13]
+            return OrderedDict({
+                    'Type: ': "ACK",
+                    'Source ID: ': source_id,
+                    'Destination ID: ': dest_id,
+                    'Sequence Number: ': sequence_number
+                })
     
-    def retransmit_strategy(self, max_retries=3, timeout=2.0):
-        """
-        Basic retransmission strategy for reliable transmission
+    async def transmit(self, message):
+        payload = message.encode()
+        frame = self.create_frame(payload)
+        modem = get_modem()
         
-        :param max_retries: Maximum number of retransmission attempts
-        :param timeout: Time to wait for acknowledgment
-        :return: Retransmission configuration
-        """
-        return {
-            'max_retries': max_retries,
-            'timeout': timeout
-        }
+        print("Sending...")
+        await modem.send(frame)
+        print("Sent!\n")
+        
+    async def receive(self):
+        modem = get_modem()
+        print("Receiving...\n")
+        rx = await modem.recv(timeout_ms=5000)
+        if rx:
+            received_frame_details = self.parse_frame(rx)
+            return received_frame_details
+        else:
+            return None
+        
+    def create_ack_frame(self, sequence_number, dest_id):
+        # Frame Structure:
+        # [Header][Source ID][Dest ID][Sequence Number][Footer]
+        # Total Overhead size is 1+6+6+1+1=15
+        
+        frame = bytearray()
+        frame.extend(self.FRAME_HEADER_ACK)
+        frame.extend(self.device_id)
+        frame.extend(dest_id)
+        frame.append(sequence_number)
+        frame.extend(self.FRAME_FOOTER)
+        return bytes(frame)
+    
+    async def transmit_ack(self, sequence_number, dest_id):
+        frame = self.create_ack_frame(sequence_number, dest_id)
+        modem = get_modem()
+        
+        print("Sending ACK...")
+        await modem.send(frame)
+        print("ACK Sent!\n")
+
 
 def get_modem():
-    from lora import sx126x
+    from lora import AsyncSX1262
 
     lora_cfg = {
         "freq_khz": 863000,
@@ -138,7 +142,7 @@ def get_modem():
         "output_power": 20,  # dBm
     }
 
-    return sx126x.SX1262(
+    return AsyncSX1262(
         spi=SPI(1, baudrate=2000_000, polarity=0, phase=0, miso=Pin(11), mosi=Pin(10), sck=Pin(9)),
         cs=Pin(8),
         busy=Pin(13),
@@ -147,45 +151,7 @@ def get_modem():
         dio3_tcxo_millivolts=1800,
         dio3_tcxo_start_time_us=1000,
         lora_cfg=lora_cfg
-    )
-
-# Example Usage
-def transmit(message):
-    """
-    Demonstrate basic Level 2 protocol usage
-    """
-    # Create two device instances
-    sender = LoRaLevel2Protocol(device_id=0x1234)
-    receiver = LoRaLevel2Protocol(device_id=0x5678)
-    
-    # Prepare payload
-    payload = b'Hello, LoRa World!'
-    
-    # Create frame
-    frame = sender.create_frame(
-        destination_id=receiver.device_id, 
-        payload=payload
-    )
-    
-    # Here goes the communication
-    modem = get_modem()
-    
-    print("Sending...")
-    modem.send(frame)
-
-def receive():
-    print("Initializing...")
-    modem = get_modem()
-    receiver = LoRaLevel2Protocol(device_id=0x5678)
-    print("Receiving...")
-    rx = modem.recv(timeout_ms=5000)
-    if rx:
-        print(f"Received: {rx!r}")
-        received_frame_details = receiver.parse_frame(rx)
-        return received_frame_details
-    else:
-        print("Timeout!")
-        
+    )   
 
 def example_transmission():
     """
